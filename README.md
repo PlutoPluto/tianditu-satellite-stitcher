@@ -32,7 +32,7 @@
 | 显示瓦片 | `img_w`（Web Mercator EPSG:3857），Leaflet 1.9.4 已内联进单文件 |
 | 下载/拼接瓦片 | `img_c`（EPSG:4490 c-tiling） |
 | 经纬度→瓦片 | `col=⌊(lon+180)/360·2^z⌋`、`row=⌊(90−lat)/360·2^z⌋` |
-| 逐行拉伸 | 第 r 行高 = `256 / max(|cos(lat)|, 1e-6)`，其中 `lat=90−360·r/2^z` |
+| 逐行拉伸 | 第 r 行高 = `256 / max(|cos(lat)|, 1e-6)`、其中 `lat=90−360·r/2^z` |
 | 并发/超时 | 8 并发、单瓦片 20s 超时、3 次/子域重试、10 轮整体重试、轮间 1–5s 退避 |
 | 防缓存 | `cache:'no-store'` + `&_cb=<时间戳>-<attempt>` |
 | 输出 | Canvas → `toBlob('image/jpeg', 0.95)` → blob URL 下载 |
