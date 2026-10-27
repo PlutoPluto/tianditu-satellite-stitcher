@@ -857,7 +857,7 @@ svg.leaflet-image-layer.leaflet-interactive path {
   <div class="box">
     <h2>请输入天地图 Token</h2>
     <p>本页面不内置任何密钥、也不上传任何数据到服务器。请前往
-      <a href="https://lbs.tianditu.gov.cn/" target="_blank">天地图控制台</a>
+      <a href="https://lbs.tianditu.gov.cn/authorize/authorization.html" target="_blank">天地图开放平台控制台</a>
       申请“浏览器端”类型 Token 后粘贴到此处（保存在浏览器本地，仅用于瓦片请求）。</p>
     <div class="row">
       <input type="password" id="token-modal-input" placeholder="天地图 Token">
@@ -921,10 +921,10 @@ function tileUrl(layer, token) {
     '&TILECOL={x}&TILEROW={y}&TILEMATRIX={z}&tk=' + encodeURIComponent(token);
 }
 
-/* 下载用的 c 剖分瓦片 URL(与后端/原脚本一致) */
-function cTileUrl(sn, col, row, zoom, token) {
-  return 'https://t' + sn + '.tianditu.gov.cn/img_c/wmts?SERVICE=WMTS&REQUEST=GetTile' +
-    '&VERSION=1.0.0&LAYER=img&STYLE=default&TILEMATRIXSET=c&FORMAT=tiles' +
+/* 下载用的 c 剖分瓦片 URL(与后端/原脚本一致); layer: img=影像, cia=影像注记 */
+function cTileUrl(layer, sn, col, row, zoom, token) {
+  return 'https://t' + sn + '.tianditu.gov.cn/' + layer + '_c/wmts?SERVICE=WMTS&REQUEST=GetTile' +
+    '&VERSION=1.0.0&LAYER=' + layer + '&STYLE=default&TILEMATRIXSET=c&FORMAT=tiles' +
     '&TILECOL=' + col + '&TILEROW=' + row + '&TILEMATRIX=' + zoom +
     '&tk=' + encodeURIComponent(token);
 }
@@ -1156,7 +1156,7 @@ function getZoom() {
 /* 瓦片下载：带超时, 失败自动换子域(t0~t7)重试;
    cache:no-store + URL cache-buster 双保险: 防止失败响应被浏览器/代理缓存,
    确保重试轮每次都真实发起新网络请求(否则重试会命中缓存空转, 网络面板看不到新请求) */
-async function fetchTile(col, row, zoom, token) {
+async function fetchTile(col, row, zoom, token, layer) {
   const base = (col + row) % 8;
   for (let attempt = 0; attempt < TILE_RETRIES; attempt++) {
     const sn = attempt === 0 ? base : (base + attempt * 3) % 8;
@@ -1164,13 +1164,18 @@ async function fetchTile(col, row, zoom, token) {
     const timer = setTimeout(() => ctrl.abort(), TILE_TIMEOUT_MS);
     try {
       /* _cb 参数让每次请求 URL 唯一, 彻底绕过任何缓存层 */
-      const url = cTileUrl(sn, col, row, zoom, token) + '&_cb=' + Date.now() + '-' + attempt;
+      const url = cTileUrl(layer, sn, col, row, zoom, token) + '&_cb=' + Date.now() + '-' + attempt;
       const resp = await fetch(url,
                                { mode: 'cors', signal: ctrl.signal, cache: 'no-store' });
       clearTimeout(timer);
       if (resp.ok) {
+        const ct = (resp.headers.get('content-type') || '').toLowerCase();
         const blob = await resp.blob();
-        if (blob.size > 100) return await createImageBitmap(blob);
+        /* 影像=JPEG(>100B 过滤错误页); 注记=PNG 且空瓦片可能极小(全透明压缩后~100B),
+           用 content-type image/* 为主判断 + 更宽的尺寸下限 */
+        const minSize = layer === 'cia' ? 40 : 100;
+        if (ct.startsWith('image/') && blob.size > minSize)
+          return await createImageBitmap(blob);
       }
     } catch (e) {
       clearTimeout(timer);  /* 超时/网络错误 -> 换子域重试 */
@@ -1183,12 +1188,17 @@ async function fetchTile(col, row, zoom, token) {
    onProgress(done, total, missing, round, attempts, backoffMs):
      round=0 时 done/total 为全局进度; round>0 时为本轮进度(重试轮进度条重置);
      backoffMs!=null 表示进入退避等待(秒级倒计时); attempts 为累计请求次数(证明在反复尝试) */
-async function downloadAllTiles(est, zoom, token, onProgress) {
-  const jobs = [];
+async function downloadAllTiles(est, zoom, token, includeCia, onProgress) {
+  const jobsImg = [];
   for (let r = est.rMin; r <= est.rMax; r++)
-    for (let c = est.cMin; c <= est.cMax; c++) jobs.push([c, r]);
-  const tiles = new Map();  // key: "row,col"
-  let pending = jobs.slice();
+    for (let c = est.cMin; c <= est.cMax; c++) jobsImg.push([c, r]);
+  const jobsCia = includeCia ? jobsImg.slice() : [];
+  const totalJobs = jobsImg.length + jobsCia.length;
+  const tiles = new Map();      // img 影像瓦片, key: "row,col"
+  const ciaTiles = new Map();   // cia 影像注记瓦片(透明PNG叠加层)
+  /* 任务队列带图层标记: [col, row, layer] */
+  let pending = jobsImg.map(([c, r]) => [c, r, 'img'])
+    .concat(jobsCia.map(([c, r]) => [c, r, 'cia']));
   let round = 0, totalAttempts = 0;
   while (pending.length > 0 && round < TILE_RETRY_ROUNDS) {
     const failedThis = [];
@@ -1197,15 +1207,15 @@ async function downloadAllTiles(est, zoom, token, onProgress) {
     async function runner() {
       while (next < pending.length) {
         const i = next++;
-        const [c, r] = pending[i];
-        const bmp = await fetchTile(c, r, zoom, token);
+        const [c, r, layer] = pending[i];
+        const bmp = await fetchTile(c, r, zoom, token, layer);
         totalAttempts++;
-        if (bmp) tiles.set(r + ',' + c, bmp);
-        else failedThis.push([c, r]);
+        if (bmp) (layer === 'cia' ? ciaTiles : tiles).set(r + ',' + c, bmp);
+        else failedThis.push([c, r, layer]);
         doneThisRound++;
         /* 第一轮报全局进度; 重试轮报本轮进度(进度条从0重新涨, 让"在下载"可见) */
-        onProgress(doneThisRound, round === 0 ? jobs.length : roundTotal,
-                   jobs.length - tiles.size, round, totalAttempts);
+        onProgress(doneThisRound, round === 0 ? totalJobs : roundTotal,
+                   totalJobs - tiles.size - ciaTiles.size, round, totalAttempts);
       }
     }
     await Promise.all(Array.from({ length: TILE_FETCH_CONCURRENCY }, runner));
@@ -1215,18 +1225,22 @@ async function downloadAllTiles(est, zoom, token, onProgress) {
       const backoffMs = 1000 * Math.min(round, 5);  // 轮间退避 1~5s
       for (let waited = 0; waited < backoffMs; waited += 1000) {
         const remain = Math.ceil((backoffMs - waited) / 1000);
-        onProgress(roundTotal, roundTotal, jobs.length - tiles.size, round,
+        onProgress(roundTotal, roundTotal, totalJobs - tiles.size - ciaTiles.size, round,
                    totalAttempts, remain);  // 倒计时(秒)
         await new Promise(res => setTimeout(res, Math.min(1000, backoffMs - waited)));
       }
     }
   }
-  return { tiles, failed: jobs.length - tiles.size, total: jobs.length,
-           rounds: round, attempts: totalAttempts };
+  return { tiles, ciaTiles,
+           failedImg: jobsImg.length - tiles.size,
+           failedCia: jobsCia.length - ciaTiles.size,
+           failed: totalJobs - tiles.size - ciaTiles.size,
+           total: totalJobs, rounds: round, attempts: totalAttempts };
 }
 
-/* 拼接: 逐行按 cos(纬度) 拉伸后垂直拼接(与后端 PIL 逻辑一致) */
-function stitchCanvas(tiles, est, zoom) {
+/* 拼接: 逐行按 cos(纬度) 拉伸后垂直拼接(与后端 PIL 逻辑一致);
+   ciaTiles 为影像注记透明 PNG 叠加层(可为 null), 画在影像之上 */
+function stitchCanvas(tiles, est, zoom, ciaTiles) {
   const TILE = 256, n = 2 ** zoom;
   const rowHeights = [];
   for (let r = est.rMin; r <= est.rMax; r++) {
@@ -1247,8 +1261,11 @@ function stitchCanvas(tiles, est, zoom) {
   for (let ri = 0; ri < est.rows; ri++) {
     const r = est.rMin + ri, h = rowHeights[ri];
     for (let ci = 0; ci < est.cols; ci++) {
-      const bmp = tiles.get(r + ',' + (est.cMin + ci));
+      const c = est.cMin + ci;
+      const bmp = tiles.get(r + ',' + c);
       if (bmp) ctx.drawImage(bmp, ci * TILE, y, TILE, h);
+      const cbmp = ciaTiles && ciaTiles.get(r + ',' + c);
+      if (cbmp) ctx.drawImage(cbmp, ci * TILE, y, TILE, h);  // 注记叠加(透明PNG, 失败处自动无注记)
     }
     y += h;
   }
@@ -1271,11 +1288,14 @@ async function startTask() {
   $('btn-start').disabled = true;
   $('progress-card').style.display = 'block';
   $('result-card').style.display = 'none';
-  setProgress('下载瓦片中', 0, est.total);
+  /* 影像注记勾选状态在任务开始时读取: 勾选则同时下载 cia 注记瓦片并叠加到输出图 */
+  const includeCia = $('chk-label').checked;
+  const totalJobs = includeCia ? est.total * 2 : est.total;
+  setProgress('下载瓦片中' + (includeCia ? '（含影像注记）' : ''), 0, totalJobs);
 
   let out;
   try {
-    out = await downloadAllTiles(est, zoom, token,
+    out = await downloadAllTiles(est, zoom, token, includeCia,
       (done, total, missing, round, attempts, remainSec) => {
         let label;
         if (remainSec != null) {
@@ -1285,7 +1305,7 @@ async function startTask() {
           /* 重试轮: 进度条显示本轮进度, label 带全局失败数与累计请求次数 */
           label = `第 ${round} 轮重试中 ${done}/${total}（共 ${missing} 块待重下，已请求 ${attempts} 次）`;
         } else {
-          label = `下载瓦片中 ${done}/${total}`;
+          label = `下载瓦片中 ${done}/${total}` + (includeCia ? '（含影像注记）' : '');
         }
         setProgress(label, done, total);
       });
@@ -1293,24 +1313,29 @@ async function startTask() {
     showStartError('下载失败: ' + err.message);
     return;
   }
-  /* 10 轮重试后仍可能有少量失败瓦片：不再取消拼接，直接拼，失败瓦片以白色呈现
-     (stitchCanvas 已用白色填底, 缺失瓦片自然留白) */
+  /* 10 轮重试后仍可能有少量失败瓦片：不再取消拼接，直接拼。
+     影像失败处白色填充; 注记失败处仅无注记叠加(不影响底图)。 */
   const partial = out.failed > 0;
   if (partial) {
-    $('start-err').textContent = `提示：仍有 ${out.failed} 块瓦片在 ${out.rounds} 轮重试（累计请求 ${out.attempts} 次）后下载失败，将以白色填充后继续拼接。`;
+    const parts = [];
+    if (out.failedImg > 0) parts.push(`${out.failedImg} 块影像瓦片（白色填充）`);
+    if (out.failedCia > 0) parts.push(`${out.failedCia} 块注记瓦片（该处无注记）`);
+    $('start-err').textContent =
+      `提示：${parts.join('、')}在 ${out.rounds} 轮重试（累计请求 ${out.attempts} 次）后下载失败，已继续拼接。`;
     $('start-err').style.display = 'block';
   }
 
   setProgress(partial ? '拼接处理中（含失败瓦片留白）' : '拼接处理中', out.total, out.total);
   await new Promise(r => setTimeout(r, 60));  // 先让进度条刷新
-  const canvas = stitchCanvas(out.tiles, est, zoom);
+  const canvas = stitchCanvas(out.tiles, est, zoom, includeCia ? out.ciaTiles : null);
   const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.95));
   if (!blob) {
     showStartError('图像编码失败（可能超出浏览器内存/画布限制），请缩小范围或降低 zoom。');
     return;
   }
   setProgress('完成', out.total, out.total);
-  showLocalResult(blob, canvas.width, canvas.height, est, zoom, out.failed, out.total);
+  showLocalResult(blob, canvas.width, canvas.height, est, zoom, out.failed, out.total,
+                  includeCia);
   $('btn-start').disabled = false;
 }
 
@@ -1328,8 +1353,9 @@ function setProgress(status, downloaded, total) {
   $('prog-count').textContent = total > 0 ? downloaded + ' / ' + total : '';
 }
 
-/* 结果展示: 预览 + 本地下载 + 角点经纬度/瓦片表(与后端公式一致) */
-function showLocalResult(blob, w, h, est, zoom, failed, total) {
+/* 结果展示: 预览 + 本地下载 + 角点经纬度/瓦片表(与后端公式一致);
+   includeCia 时失败/总数含注记瓦片并标注 */
+function showLocalResult(blob, w, h, est, zoom, failed, total, includeCia) {
   if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
   lastBlobUrl = URL.createObjectURL(blob);
   $('result-card').style.display = 'block';
@@ -1337,7 +1363,8 @@ function showLocalResult(blob, w, h, est, zoom, failed, total) {
   img.src = lastBlobUrl;
   img.onclick = () => window.open(lastBlobUrl, '_blank');
   $('res-size').textContent = w + ' × ' + h + ' px';
-  $('res-failed').textContent = failed + ' / ' + total + ' 块';
+  $('res-failed').textContent = failed + ' / ' + total + ' 块' +
+    (includeCia ? '（含影像注记）' : '');
   $('res-grid').textContent = est.rows + ' 行 × ' + est.cols + ' 列';
   const dl = $('btn-download');
   dl.href = lastBlobUrl;
